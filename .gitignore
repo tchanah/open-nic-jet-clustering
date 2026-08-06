@@ -1,0 +1,15 @@
+# cocotb / iverilog simulation artifacts
+**/sim_build/
+**/results.xml
+**/__pycache__/
+*.pyc
+
+# capture output
+*.pcap
+
+# Vivado run artifacts (incl. timestamped/backup journals)
+vivado*.jou
+vivado*.log
+vivado*.backup.*
+*.str
+.Xil/
