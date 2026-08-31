@@ -1,5 +1,5 @@
 # cocotb / iverilog simulation artifacts
-**/sim_build/
+**/sim_build*/
 **/results.xml
 **/__pycache__/
 *.pyc
@@ -13,3 +13,6 @@ vivado*.log
 vivado*.backup.*
 *.str
 .Xil/
+
+# out-of-context synthesis output (regenerate with syn/sweep_ooc.sh)
+syn/reports/
