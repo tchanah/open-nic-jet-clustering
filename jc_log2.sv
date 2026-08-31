@@ -113,6 +113,23 @@ module jc_log2 (
   wire [IDX_BITS-1:0] idx_s2 = mant_s2[MANT_W-1 -: IDX_BITS];
   wire [FRC_BITS-1:0] frc_s2 = mant_s2[FRC_BITS-1:0];
 
+  // ONE BIT WIDER, AND THAT BIT IS THE WHOLE POINT. An array index is a
+  // self-determined expression in Verilog, so `idx_s2 + 1'b1` is evaluated at
+  // IDX_BITS and WRAPS TO 0 on the top bin -- reading log2(1) = 0 as the upper
+  // interpolation point instead of log2(2) = 1.0. The table is 2^k + 1 deep
+  // precisely to carry that entry, and this is what lets the index reach it.
+  //
+  // The failure is not a rounding error. The slope at the top bin should be
+  // +1.76e-4; wrapped it is -0.99982, and jc_lut_log2m is UNSIGNED, so the
+  // subtract wraps to a huge positive rather than going negative and the
+  // interpolation explodes. It fires when the top IDX_BITS mantissa bits are
+  // all ones -- one input in 2^IDX_BITS -- which is why hundreds of random
+  // bench vectors never drew it and 5 events in 1000 clustered wrongly.
+  //
+  // Vivado reporting the ROM as 4096x32 instead of 4097 is the symptom to
+  // watch: check syn/reports/jc_log2_ooc.log after any change here.
+  wire [IDX_BITS:0]   idx_hi_s2 = {1'b0, idx_s2} + 1'b1;
+
   logic [TAB_W-1:0]   tab_lo_s3, tab_hi_s3;
   logic [FRC_BITS-1:0] frc_s3;
   logic [EXP_W-1:0]   e_s3;
@@ -126,7 +143,7 @@ module jc_log2 (
       zero_s3   <= zero_s2;
       frc_s3    <= frc_s2;
       tab_lo_s3 <= jc_lut_log2m[idx_s2];
-      tab_hi_s3 <= jc_lut_log2m[idx_s2 + 1'b1];
+      tab_hi_s3 <= jc_lut_log2m[idx_hi_s2];
     end
   end
 

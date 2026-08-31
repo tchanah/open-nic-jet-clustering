@@ -202,3 +202,53 @@ async def test_back_to_back_and_bubbles(dut):
             await RisingEdge(dut.aclk)
 
     assert dense == sparse, "results changed with input spacing"
+
+
+@cocotb.test()
+async def test_top_table_index_does_not_wrap(dut):
+    """The last bin must interpolate against the LAST table entry.
+
+    The table is 2^IDX_BITS + 1 deep so the top bin has an upper point,
+    log2(2) = 1.0. But an array index is a SELF-DETERMINED expression in
+    Verilog: at IDX_BITS wide, idx + 1 wraps to 0 and the upper point becomes
+    log2(1) = 0. The slope should be +1.76e-4; wrapped it is -0.99982, and the
+    table is unsigned, so that subtract wraps to a huge positive rather than
+    going negative -- the result is not slightly wrong, it is garbage.
+
+    THIS IS NOT A NEW KIND OF CHECK. test_bit_exact_against_model would catch
+    it -- its Python model indexes a real list and does not wrap -- and so
+    would the accuracy test. Neither ever drew the value: it needs the top
+    IDX_BITS mantissa bits all ones, one input in 2^IDX_BITS, against a few
+    hundred random draws. On hardware that is ~1 call in 4096, which was
+    enough to mis-cluster 5 real events in 1000.
+
+    Directed vectors, not more random ones, are the lesson. A residual class
+    this thin is found by naming it, not by sampling harder.
+    """
+    await start_dut(dut)
+    top = (1 << IDX_BITS) - 1
+    # frc MUST include non-zero values and frc = 0 is NOT sufficient on its
+    # own: the slope is multiplied by frc, so at frc = 0 a wrapped upper point
+    # is invisible -- both behaviours give 3.1e-11. The discriminating vectors
+    # are the interior ones, which read 2.9e-9 fixed against 0.5 wrapped.
+    # Keep frc = 0 as the boundary case, never as the whole list.
+    vals = []
+    for e in (MANT_W, MANT_W + 7, IN_W - 1):
+        for frc in (0, 1, (1 << FRC_BITS) // 2, (1 << FRC_BITS) - 1):
+            vals.append((1 << e) | (top << (e - IDX_BITS))
+                        | (frc << (e - MANT_W)))
+
+    got = await run(dut, vals)
+    worst, worst_x = 0.0, 0
+    for x, (val, _z) in zip(vals, got):
+        assert val == model(x), (
+            f"x={x:#x}: got {val:#x}, model {model(x):#x} -- the top table "
+            f"index wrapped. Check the width of the +1 feeding "
+            f"jc_lut_log2m in jc_log2.sv; Vivado reporting the ROM as "
+            f"4096x32 rather than 4097 is the same fault.")
+        err = abs(val / (1 << OUT_FRAC) - math.log2(x))
+        if err > worst:
+            worst, worst_x = err, x
+    dut._log.info("top-index worst error: %.3e at x=%#x  (%.1f%% of a delta "
+                  "LSB)", worst, worst_x, 100 * worst / DELTA_LSB_RAD)
+    assert worst < 3e-8, f"worst log2 error {worst:.3e} at x={worst_x:#x}"
