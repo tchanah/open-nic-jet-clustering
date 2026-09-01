@@ -57,6 +57,8 @@ import math
 import pathlib
 import struct
 
+import jc_exact
+
 HERE = pathlib.Path(__file__).resolve().parent
 
 ETH_TYPE = 0x88B6
@@ -79,6 +81,15 @@ HDR_BYTES = 64
 # 2pi/64 in phi apart -- six orders of magnitude away. Only two merged jets
 # could ever collide this closely, by coincidence.
 LOG_ZERO_DIST = 0
+
+# jc_log2 emits Q7.32; nn_dist_log is Q7.25. jc_ctrl.sv:255 sheds the
+# difference with a truncating slice.
+LOG_TO_NN = 32 - 25
+
+# The two units this model used to idealise, now bit-accurate. Module level
+# because they are pure functions of the generated tables, which every
+# Formats instance reads from the same file.
+EXACT = jc_exact.Exact()
 
 
 def to_signed(word, width):
@@ -197,21 +208,47 @@ def geo_dist_sq(a, b, fmt):
 
 
 def q_log2(geo, fmt):
+    """log2(distance) in Q7.25, exactly as the engine produces it.
+
+    Two steps, both the RTL's: jc_log2's table-and-interpolate in Q7.32, then
+    jc_ctrl's conversion to nn_dist_log's Q7.25, which is a plain TRUNCATING
+    shift (`sk_ext_log_rsp[LOG_OUT_W-1:LOG_TO_NN]`, jc_ctrl.sv:255) -- not the
+    rounding this used to do.
+
+    Until this was the table, no model layer could see a table bug at all:
+    the jc_log2 index wrap that mis-clustered 5 events in 1000 was invisible
+    here and took a synthesis report to find.
+    """
     if geo <= 0:
         return LOG_ZERO_DIST
-    return int(round(math.log2(geo) * (1 << fmt.wgt_frac)))
+    return EXACT.log2(geo) >> LOG_TO_NN
 
 
 def set_kin(jet, fmt):
-    """Recompute coordinates after a merge.
+    """Recompute coordinates after a merge, exactly as jc_setkin does.
 
     FastJet's numerically stable rapidity, not the naive ratio: pt_sq +
     mass_sq is mT^2, so E - |pz| is never formed. Bit-agreement with FastJet
     depends on using this exact form.
 
-    Done in float64 here and quantised on the way out. jc_setkin (step 6) will
-    replace this with a CORDIC and a log chain; isolating it this way keeps
-    the ranking questions separate from the setkin-precision question.
+    THIS IS THE RTL'S ARITHMETIC, not float64 quantised on the way out. It was
+    the latter until seq 870 of cells1k showed what that costs: rows 15 and 17
+    were bit-identically equidistant from a merged row, the model broke the tie
+    by smallest index, and jc_setkin's coordinate -- 4.6e-9 rad away, 2.5% of a
+    delta LSB -- landed on the other side of a truncation boundary. One delta
+    LSB of geo, the tie became a strict inequality, and one merge became an
+    emit. Exact ties are routine on this lattice (2-6% of row scans), so a
+    sub-LSB difference decides jets. See set_kin_float for the old behaviour
+    and what it costs.
+    """
+    jet.y, jet.phi, jet.wgt = EXACT.set_kin(jet.e, jet.px, jet.py, jet.pz)
+
+
+def set_kin_float(jet, fmt):
+    """The pre-jc_exact set_kin: float64 trigonometry, quantised on the way out.
+
+    Kept so the cost of the idealisation stays measurable rather than
+    remembered. Not used by cluster_fixed.
     """
     e = fmt.p4_to_float(jet.e)
     px, py = fmt.p4_to_float(jet.px), fmt.p4_to_float(jet.py)

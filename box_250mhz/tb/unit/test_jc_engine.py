@@ -34,6 +34,7 @@ cells is a bug you can still read a waveform for.
 
 import json
 import math
+import os
 import pathlib
 import random
 import sys
@@ -388,3 +389,128 @@ async def test_back_to_back_events(dut):
 
     assert int(dut.event_count.value) == 2, (
         f"event_count = {int(dut.event_count.value)}")
+
+
+# ----------------------------------------------------------------- tracing ---
+# jc_ctrl's state encoding, from jc_ctrl.sv. Only the three the round decision
+# passes through are needed: DECIDE latches the argmin winner, then branches to
+# EMIT or MERGE_I on the stored beam bit.
+S_DECIDE, S_EMIT, S_MERGE_I = 9, 10, 13
+
+
+async def trace_nn_writes(dut, done, log, watch):
+    """Every write to one row's nearest-neighbour record, and who made it.
+
+    Two paths write it and only one goes through jc_ctrl: the controller's
+    single-entry write after a scan, and jc_sweep's per-lane write-back claim
+    during the survivor's own scan. A row whose stored neighbour is wrong was
+    either written wrongly by one of them or never written at all, and the jet
+    list cannot tell those apart.
+    """
+    lanes = int(dut.LANES.value) if hasattr(dut, "LANES") else 16
+    while not done[0]:
+        await RisingEdge(dut.aclk)
+        try:
+            if int(dut.u_ctrl.mem_nn_wr_en.value):
+                idx = int(dut.u_ctrl.mem_nn_wr_idx.value)
+                if idx == watch:
+                    log.append(("ctrl", idx,
+                                int(dut.u_ctrl.mem_nn_wr_beam.value),
+                                int(dut.u_ctrl.mem_nn_wr_index.value),
+                                int(dut.u_ctrl.mem_nn_wr_geo.value)))
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
+            en = int(dut.u_sweep.mem_wb_en.value)
+            if en:
+                off = int(dut.u_sweep.mem_wb_off.value)
+                idxs = int(dut.u_sweep.mem_wb_nn_index.value)
+                geos = int(dut.u_sweep.mem_wb_nn_geo.value)
+                iw = int(dut.u_sweep.IDX_W.value)
+                gw = int(dut.u_sweep.GEO_W.value)
+                for l in range(lanes):
+                    if (en >> l) & 1 and off * lanes + l == watch:
+                        log.append(("claim", off * lanes + l, 0,
+                                    (idxs >> (l * iw)) & ((1 << iw) - 1),
+                                    (geos >> (l * gw)) & ((1 << gw) - 1)))
+        except Exception:                                      # noqa: BLE001
+            pass
+
+
+async def trace_rounds(dut, done, log):
+    """Record one line per round: which row won, and merge or emit.
+
+    The comparison this exists for is against scratchpad/trace_model.py, which
+    replays cluster_fixed's decisions in the same shape. The first round where
+    the two disagree is the bug -- everything after it is consequence.
+    """
+    prev = -1
+    surv = absorbed = -1
+    while not done[0]:
+        await RisingEdge(dut.aclk)
+        try:
+            st = int(dut.u_ctrl.state.value)
+        except Exception:                                      # noqa: BLE001
+            continue
+        if st == S_DECIDE and prev != S_DECIDE:
+            try:
+                surv = int(dut.u_ctrl.surv.value)
+                absorbed = int(dut.u_ctrl.probe_nnidx.value)
+            except Exception:                                  # noqa: BLE001
+                surv = absorbed = -1
+        elif prev == S_DECIDE and st == S_EMIT:
+            log.append(("EMIT", surv, -1))
+        elif prev == S_DECIDE and st == S_MERGE_I:
+            log.append(("MERGE", surv, absorbed))
+        prev = st
+
+
+@cocotb.test()
+async def test_trace_round_decisions(dut):
+    """Dump the RTL's merge/emit sequence for the fixture's first event.
+
+    Diagnostic, not an assertion: seq 657 and 870 cluster differently on the
+    card AND in simulation than jc_model.py does, and the jet list alone says
+    only that they ended up different, not where they parted. Pair this with
+    scratchpad/trace_model.py on the same seq and diff the two.
+    """
+    await start_dut(dut, 0.0)
+    events = all_events()
+    if not events:
+        dut._log.warning("no fixture; skipping trace")
+        return
+
+    seq, cells = events[0]
+    jets_in = M.ingest(cells, FMT)
+    done = [False]
+    log = []
+    # Set JC_WATCH_ROW to follow one row's nn record as well as the rounds.
+    watch = int(os.environ.get("JC_WATCH_ROW", "-1"))
+    nnlog = []
+    cocotb.start_soon(evbuf(dut, jets_in, seq, done))
+    cocotb.start_soon(trace_rounds(dut, done, log))
+    if watch >= 0:
+        cocotb.start_soon(trace_nn_writes(dut, done, nnlog, watch))
+
+    for _ in range(400000):
+        await RisingEdge(dut.aclk)
+        if dut.jet_eoe.value:
+            break
+    done[0] = True
+    await RisingEdge(dut.aclk)
+
+    want = M.cluster_fixed(cells, FMT, R_RAD, 0.0)
+    merges = sum(1 for a, _s, _b in log if a == "MERGE")
+    emits = sum(1 for a, _s, _b in log if a == "EMIT")
+    dut._log.info("seq %d: n=%d, %d rounds (%d merge, %d emit); model wants "
+                  "%d jets", seq, len(cells), len(log), merges, emits,
+                  len(want))
+    dut._log.info("rnd  action        i    j")
+    for n, (act, s, b) in enumerate(log):
+        dut._log.info("%3d  %-6s %6d %4d", n, act, s, b)
+
+    if watch >= 0:
+        dut._log.info("nn writes to row %d: %d", watch, len(nnlog))
+        for who, idx, beam, nn, geo in nnlog:
+            dut._log.info("  %-6s row=%-3d beam=%d nn=%-3d geo=%d",
+                          who, idx, beam, nn, geo)
