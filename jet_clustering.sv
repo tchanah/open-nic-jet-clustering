@@ -2,9 +2,11 @@
 //
 // jet_clustering -- top of the anti-kt jet clustering datapath.
 //
-// Sits in the box_250mhz RX path: calorimeter-cell events arrive from the
-// network (CMAC RX via the packet adapter) and jets leave toward the host
-// (QDMA C2H). Single 250 MHz domain for the datapath, 512-bit AXI-Stream,
+// A BUMP IN THE WIRE: calorimeter-cell events arrive from the network on
+// CMAC port 0 RX and jets leave on CMAC port 1 TX, to be captured on a third
+// machine. Nothing goes to the local host -- QDMA C2H is tied off, so the
+// PCIe side carries control and status only.
+// Single 250 MHz domain for the datapath, 512-bit AXI-Stream,
 // 48-bit tuser = {dst[47:32], src[31:16], size[15:0]}. AXI-Lite arrives on its
 // own 125 MHz clock and is crossed inside jc_regs.
 //

@@ -48,9 +48,17 @@
 // configured clusters correctly from the first packet, and no start-up
 // transfer has to be sequenced before the datapath is trustworthy.
 //
+// CONFIG IS SHADOW-PLUS-COMMIT, AND THAT IS NOT CEREMONY. R is 49 bits and the
+// pt floor is 96, so the host sets them over two and three AXI-Lite words. If
+// every word armed its own crossing -- which is what this did -- then between
+// RSQ_LO and RSQ_HI the datapath would hold {old_hi, new_lo}: an R that was
+// never asked for, entirely plausible, and impossible to detect downstream.
+// Writes now land only in the shadow registers; COMMIT is what publishes them,
+// so what crosses is always a whole config the host actually intended.
+//
 // Register map, byte offsets in the plugin's 0x80 window:
 //
-//   0x00  ID              RO  0x4A430001, "JC" and the map version
+//   0x00  ID              RO  0x4A430002, "JC" and the map version
 //   0x04  SCRATCH         RW  proves the bus works, nothing reads it
 //   0x08  STATUS          RO  bit 0 = engine idle
 //   0x10  R_SQUARED_LO    RW  cfg_r_squared[31:0]
@@ -63,6 +71,7 @@
 //   0x2C  SRC_MAC_LO      RW
 //   0x30  SRC_MAC_HI      RW
 //   0x34  TUSER_SRC       RW  the src field driven on egress tuser
+//   0x38  COMMIT          WO  write anything -- publishes the shadow above
 //   0x40  CNT_FRAMES_IN   RO  ingress frames seen
 //   0x44  CNT_BAD_HEADER  RO  wrong ethertype / version / count
 //   0x48  CNT_BAD_LENGTH  RO  framing disagrees with its own header
@@ -139,7 +148,7 @@ module jc_regs #(
     R_FLR_0     = 6'h06, R_FLR_1     = 6'h07, R_FLR_2    = 6'h08,
     R_DMAC_LO   = 6'h09, R_DMAC_HI   = 6'h0A,
     R_SMAC_LO   = 6'h0B, R_SMAC_HI   = 6'h0C,
-    R_TUSER_SRC = 6'h0D,
+    R_TUSER_SRC = 6'h0D, R_COMMIT    = 6'h0E,
     R_FRAMES_IN = 6'h10, R_BAD_HDR   = 6'h11, R_BAD_LEN  = 6'h12,
     R_ACCEPT    = 6'h13, R_DROP_FULL = 6'h14, R_DROP_ERR = 6'h15,
     R_EVENTS    = 6'h16, R_JETS_OUT  = 6'h17, R_FRAMES_O = 6'h18,
@@ -186,15 +195,15 @@ module jc_regs #(
   logic     [31:0]  scratch_q;
   logic             cfg_dirty;
 
-  wire cfg_write = wr && (idx == R_RSQ_LO  || idx == R_RSQ_HI
-                       || idx == R_FLR_0   || idx == R_FLR_1 || idx == R_FLR_2
-                       || idx == R_DMAC_LO || idx == R_DMAC_HI
-                       || idx == R_SMAC_LO || idx == R_SMAC_HI
-                       || idx == R_TUSER_SRC);
+  // COMMIT alone arms the crossing. The field writes below move shadows only,
+  // so a multiword field can never cross half-written.
+  wire cfg_commit = wr && (idx == R_COMMIT);
 
   logic cfg_send;
   wire  cfg_rcv;
-  wire  cfg_done = cfg_send && cfg_rcv;
+  // The xpm captures src_in on the cycle src_send asserts, so LAUNCH is the
+  // moment the shadow has been taken -- see the clear below.
+  wire  cfg_launch = !cfg_send && !cfg_rcv && cfg_dirty;
 
   always_ff @(posedge axil_aclk) begin
     if (!axil_aresetn) begin
@@ -207,10 +216,15 @@ module jc_regs #(
       cfg_dirty <= 1'b0;
     end
     else begin
-      // Clear first so a write landing on the same cycle as a completed
-      // transfer still re-arms: the last value written must always get across.
-      if (cfg_done)  cfg_dirty <= 1'b0;
-      if (cfg_write) cfg_dirty <= 1'b1;
+      // CLEAR ON LAUNCH, NOT ON COMPLETION. The xpm has already taken the
+      // shadow by then, so a commit landing while a transfer is in flight must
+      // arm a fresh one. Clearing at completion instead drops it on the floor
+      // and strands the newest config until some unrelated later commit --
+      // which, combined with a torn multiword field, is how a wrong R becomes
+      // permanent rather than momentary. A commit on the launch cycle wins
+      // below, so the last value committed always gets its own transfer.
+      if (cfg_launch) cfg_dirty <= 1'b0;
+      if (cfg_commit) cfg_dirty <= 1'b1;
 
       if (wr) begin
         case (idx)
@@ -232,16 +246,16 @@ module jc_regs #(
   end
 
   // Hold src_send until the far side acknowledges, then re-arm if another
-  // write has landed meanwhile.
-  // The !cfg_rcv guard is the same protocol requirement the snapshot side
-  // above explains at length. Latent rather than observed here: this re-arms
-  // only on cfg_dirty, and two host writes are microseconds apart, so cfg_rcv
-  // has always fallen by then. It costs nothing to make the property hold by
-  // construction rather than by the host bus being slow.
+  // commit has landed meanwhile.
+  // The !cfg_rcv guard folded into cfg_launch is the same protocol requirement
+  // the snapshot side below explains at length. Latent rather than observed
+  // here: two host writes are microseconds apart, so cfg_rcv has always fallen
+  // by then. It costs nothing to make the property hold by construction rather
+  // than by the host bus being slow.
   always_ff @(posedge axil_aclk) begin
-    if (!axil_aresetn)          cfg_send <= 1'b0;
+    if (!axil_aresetn)            cfg_send <= 1'b0;
     else if (cfg_send && cfg_rcv) cfg_send <= 1'b0;
-    else if (!cfg_send && !cfg_rcv && cfg_dirty) cfg_send <= 1'b1;
+    else if (cfg_launch)          cfg_send <= 1'b1;
   end
 
   wire [CFG_W-1:0] cfg_flat = {tsrc_q, smac_q, dmac_q, flr_q, rsq_q};
@@ -358,7 +372,7 @@ module jc_regs #(
   always_comb begin
     reg_dout = 32'd0;
     case (idx)
-      R_ID:        reg_dout = 32'h4A43_0001;
+      R_ID:        reg_dout = 32'h4A43_0002;
       R_SCRATCH:   reg_dout = scratch_q;
       R_STATUS:    reg_dout = {31'd0, snap_q[SNAP_W-1]};
       R_RSQ_LO:    reg_dout = rsq_q[31:0];

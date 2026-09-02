@@ -53,6 +53,7 @@ REG_SCRATCH = 0x04
 REG_STATUS = 0x08
 REG_RSQ_LO, REG_RSQ_HI = 0x10, 0x14
 REG_FLR_0, REG_FLR_1, REG_FLR_2 = 0x18, 0x1C, 0x20
+REG_COMMIT = 0x38
 REG_FRAMES_IN = 0x40
 REG_BAD_HEADER = 0x44
 REG_BAD_LENGTH = 0x48
@@ -213,6 +214,8 @@ async def set_floor(dut, gev):
     await axil_write(dut, REG_FLR_0, v & 0xFFFFFFFF)
     await axil_write(dut, REG_FLR_1, (v >> 32) & 0xFFFFFFFF)
     await axil_write(dut, REG_FLR_2, (v >> 64) & 0xFFFFFFFF)
+    # Field writes only move shadows; COMMIT is what crosses them, as one.
+    await axil_write(dut, REG_COMMIT, 1)
     # The config crossing is a handshake; give it time to land before the
     # datapath is expected to honour the new value.
     for _ in range(40):
@@ -223,6 +226,7 @@ async def set_r(dut, r_rad):
     v = FMT.r_squared(r_rad)
     await axil_write(dut, REG_RSQ_LO, v & 0xFFFFFFFF)
     await axil_write(dut, REG_RSQ_HI, (v >> 32) & 0xFFFFFFFF)
+    await axil_write(dut, REG_COMMIT, 1)
     for _ in range(40):
         await RisingEdge(dut.axil_aclk)
 
@@ -260,7 +264,7 @@ async def test_axil_identity_and_scratch(dut):
     """The bus answers, and a register holds what was written."""
     await start_dut(dut)
     ident = await axil_read(dut, REG_ID)
-    assert ident == 0x4A430001, f"ID reads {ident:#010x}"
+    assert ident == 0x4A430002, f"ID reads {ident:#010x}"
 
     await axil_write(dut, REG_SCRATCH, 0xDEADBEEF)
     got = await axil_read(dut, REG_SCRATCH)
@@ -843,3 +847,83 @@ async def test_full_scale_event(dut):
     dut._log.info("seq %d: n=%d -> %d jets in %d cycles (%.1f/cell)",
                   seq, len(cells), f["njets"], f["cycles"],
                   f["cycles"] / len(cells))
+
+
+# --------------------------------------------------- config atomicity ----
+# Both of these are about jc_regs' config crossing, and both failure modes
+# are silent on the datapath: a wrong R is entirely plausible and nothing
+# downstream can flag it. Neither is reachable through the register READ
+# path, which returns the shadow -- only cfg_r_squared on the aclk side says
+# what the engine is actually using.
+
+@cocotb.test()
+async def test_config_does_not_cross_half_written(dut):
+    """A multiword field never reaches the datapath torn.
+
+    R is 49 bits, so the host sets it over two AXI-Lite words. When every word
+    armed its own crossing, the engine briefly held {old_hi, new_lo} -- an R
+    nobody asked for. Writes now stage in shadows; COMMIT publishes them whole.
+    """
+    await start_dut(dut)
+    before = int(dut.cfg_r_squared.value)
+
+    # Half a field, uncommitted. Nothing may cross, however long we wait.
+    await axil_write(dut, REG_RSQ_LO, 0xDEADBEEF)
+    for _ in range(80):
+        await RisingEdge(dut.axil_aclk)
+    assert int(dut.cfg_r_squared.value) == before, (
+        "an uncommitted word reached the datapath -- R crossed torn")
+
+    # The shadow did take it: this is staging, not rejection.
+    assert await axil_read(dut, REG_RSQ_LO) == 0xDEADBEEF, \
+        "shadow register did not accept the write"
+
+    # Complete the field and commit: now it crosses, as one value.
+    want = FMT.r_squared(0.7)
+    await axil_write(dut, REG_RSQ_LO, want & 0xFFFFFFFF)
+    await axil_write(dut, REG_RSQ_HI, (want >> 32) & 0xFFFFFFFF)
+    await axil_write(dut, REG_COMMIT, 1)
+    for _ in range(80):
+        await RisingEdge(dut.axil_aclk)
+    assert int(dut.cfg_r_squared.value) == want, (
+        f"committed R read back {int(dut.cfg_r_squared.value)}, want {want}")
+
+
+@cocotb.test()
+async def test_commit_during_transfer_is_not_lost(dut):
+    """The last committed value always reaches the datapath.
+
+    xpm_cdc_handshake takes src_in when src_send asserts, so the dirty flag
+    must clear at LAUNCH. Clearing it at completion instead loses any commit
+    that landed while the older transfer was in flight: the newest config then
+    sits stranded in the shadows until some unrelated later commit -- which is
+    how a torn R becomes permanent rather than momentary.
+
+    The flight window is a handful of cycles, so sweep the delay rather than
+    guess it. Only the low word moves, to keep the second commit tight.
+    """
+    await start_dut(dut)
+    base = FMT.r_squared(0.4)
+    hi = (base >> 32) & 0x1FFFF          # GEO_W is 49, so 17 bits up here
+    a_lo = base & 0xFFFFFFFF
+    b_lo = a_lo ^ 0x1234
+    a, b = (hi << 32) | a_lo, (hi << 32) | b_lo
+    assert a != b
+
+    await axil_write(dut, REG_RSQ_HI, hi)
+
+    for delay in range(14):
+        await axil_write(dut, REG_RSQ_LO, a_lo)
+        await axil_write(dut, REG_COMMIT, 1)
+        for _ in range(delay):
+            await RisingEdge(dut.axil_aclk)
+        # Second commit, aimed into the first transfer's flight window.
+        await axil_write(dut, REG_RSQ_LO, b_lo)
+        await axil_write(dut, REG_COMMIT, 1)
+        for _ in range(80):
+            await RisingEdge(dut.axil_aclk)
+        got = int(dut.cfg_r_squared.value)
+        assert got == b, (
+            f"delay {delay}: engine holds {got}, last commit was {b} -- "
+            f"a commit was dropped while a transfer was in flight"
+            + (" (it is still showing the previous value)" if got == a else ""))

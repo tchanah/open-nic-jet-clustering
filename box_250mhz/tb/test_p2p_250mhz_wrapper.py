@@ -152,7 +152,7 @@ async def test_register_file_is_reachable(dut):
     await tb.reset()
 
     ident = await tb.control.read_dword(0x0000)
-    assert ident == 0x4A430001, (
+    assert ident == 0x4A430002, (
         f"ID register reads {ident:#010x}; the box's ingress AXI-Lite channel "
         f"does not reach jc_regs")
 
@@ -193,8 +193,13 @@ async def test_rx_produces_a_jets_frame(dut):
 
     # Floor to zero, so any event produces jets and the test cannot pass by
     # the trigger legitimately staying silent.
+    # The three words only stage a shadow; COMMIT (0x38) is what crosses them
+    # to the datapath. Without it the floor stays at its 50 GeV reset default,
+    # this event emits nothing, and the test hangs waiting for a frame that
+    # was never going to come.
     for off, word in ((0x0018, 0), (0x001C, 0), (0x0020, 0)):
         await tb.control.write_dword(off, word)
+    await tb.control.write_dword(0x0038, 1)
     for _ in range(40):
         await RisingEdge(dut.axil_aclk)
 

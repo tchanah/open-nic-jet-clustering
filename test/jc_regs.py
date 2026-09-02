@@ -51,6 +51,7 @@ REG = {
     "SMAC_LO":     0x2C,
     "SMAC_HI":     0x30,
     "TUSER_SRC":   0x34,
+    "COMMIT":      0x38,
 }
 
 # The ladder, in datapath order. The first stage reading zero is the stage
@@ -62,7 +63,7 @@ LADDER = [
     ("suppressed",  0x64), ("last_cycles", 0x68),
 ]
 
-EXPECT_ID = 0x4A430001          # "JC" and the map version
+EXPECT_ID = 0x4A430002          # "JC" and the map version
 
 LUTS = json.loads(
     (pathlib.Path(__file__).resolve().parents[1] / "model" / "luts.json")
@@ -107,6 +108,24 @@ class Bar:
 
     def wr(self, off, val):
         ctypes.c_uint32.from_buffer(self.m, JC_BASE + off).value = val & 0xFFFFFFFF
+
+    def commit(self):
+        """Publish the shadow registers to the datapath as ONE config.
+
+        Field writes only move shadows; nothing crosses to the 250 MHz side
+        until this lands. That is the point: R is 49 bits and the pt floor is
+        96, so they take two and three words, and a per-word crossing would let
+        the engine hold {old_hi, new_lo} -- an R nobody asked for, entirely
+        plausible, and invisible downstream.
+
+        Config is quasi-static by intent, so committing while an event is
+        mid-cluster is a host mistake rather than something the card defends
+        against. Warn, do not block.
+        """
+        if not (self.rd(REG["STATUS"]) & 1):
+            print("  warning: engine is not idle -- committing now can change "
+                  "R or the floor part-way through an event", file=sys.stderr)
+        self.wr(REG["COMMIT"], 1)
 
     def check_id(self):
         ident = self.rd(REG["ID"])
@@ -183,6 +202,7 @@ def main():
             else ("SMAC_LO", "SMAC_HI")
         b.wr(REG[lo], v & 0xFFFFFFFF)
         b.wr(REG[hi], (v >> 32) & 0xFFFF)
+        b.commit()
         print("%s = %s" % (cmd[4:], int_to_mac(
             b.rd(REG[lo]) | (b.rd(REG[hi]) << 32))))
 
@@ -190,6 +210,7 @@ def main():
         v = r_squared(float(args[0]))
         b.wr(REG["RSQ_LO"], v & 0xFFFFFFFF)
         b.wr(REG["RSQ_HI"], (v >> 32) & 0xFFFFFFFF)
+        b.commit()
         print("R = %s rad -> R^2 = %d" % (args[0], v))
 
     elif cmd == "set-floor":
@@ -197,10 +218,12 @@ def main():
         b.wr(REG["FLR_0"], v & 0xFFFFFFFF)
         b.wr(REG["FLR_1"], (v >> 32) & 0xFFFFFFFF)
         b.wr(REG["FLR_2"], (v >> 64) & 0xFFFFFFFF)
+        b.commit()
         print("floor = %s GeV -> pt_sq_floor = %d" % (args[0], v))
 
     elif cmd == "set-tuser-src":
         b.wr(REG["TUSER_SRC"], int(args[0], 0) & 0xFFFF)
+        b.commit()
         print("tuser_src = %d" % b.rd(REG["TUSER_SRC"]))
 
     elif cmd == "scratch":
