@@ -91,8 +91,26 @@ def parse_jets_frame(beats):
     return out
 
 
+class ShortFrame(ValueError):
+    """A captured frame is shorter than its own header says it should be."""
+
+
 def parse_jets_bytes(payload):
-    """Same, from a flat byte string -- for benches using cocotbext-axi."""
+    """Same, from a flat byte string -- for captures and cocotbext-axi benches.
+
+    Raises ShortFrame rather than struct.error on a truncated capture. That is
+    nearly always tcpdump killed before it flushed its last record, not a card
+    fault, and the two have to be tellable apart at a glance -- so the check
+    names the byte counts instead of dying somewhere inside struct.unpack.
+
+    A short HEADER is the worse case and the reason this checks first: the
+    slices below would read past the end and quietly return zero, so a
+    truncated frame would parse as a perfectly valid one carrying no jets.
+    """
+    if len(payload) < HDR_BYTES:
+        raise ShortFrame(
+            f"frame is {len(payload)} bytes, shorter than the "
+            f"{HDR_BYTES}-byte header -- truncated capture")
     hdr = payload[:HDR_BYTES]
     # The drop/bad counts are here as well as in jc_regs, and they are sampled
     # on the aclk side at jet_eoe -- so they stay readable even when the
@@ -110,6 +128,12 @@ def parse_jets_bytes(payload):
         "jets": [],
     }
     body = payload[HDR_BYTES:]
-    for o in range(0, out["njets"] * 16, 16):
+    need = out["njets"] * 16
+    if len(body) < need:
+        raise ShortFrame(
+            f"seq {out['seq']}: header claims {out['njets']} jets, so the "
+            f"frame should be {HDR_BYTES + need} bytes; it is {len(payload)} "
+            f"-- truncated capture")
+    for o in range(0, need, 16):
         out["jets"].append(struct.unpack(">ffff", body[o:o + 16]))
     return out

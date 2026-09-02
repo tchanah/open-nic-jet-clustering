@@ -30,7 +30,7 @@ sys.path.insert(0, str(ROOT / "model"))
 
 import jc_model as M                                          # noqa: E402
 from jc_frames import (parse_jets_bytes, expected_jets,       # noqa: E402
-                       ETH_TYPE_OUT)
+                       ETH_TYPE_OUT, ShortFrame)
 
 DEFAULT_PKT = pathlib.Path("/scratch/chettige/cells1k.pkt.bin")
 FMT = M.Formats(ROOT / "model" / "luts.json")
@@ -96,21 +96,29 @@ def main():
         if args.count is not None and len(cells_by_seq) >= args.count:
             break
 
-    frames, wrong_type = [], 0
+    # A truncated frame is a CAPTURE artifact, not a card fault -- tcpdump
+    # returns before flushing its last record, so killing it promptly clips
+    # one frame. Report those and carry on rather than discarding a run that
+    # may have taken half an hour to inject.
+    frames, wrong_type, short = [], 0, []
     for pkt in read_pcap(args.file):
-        if len(pkt) < 64:
-            continue
+        if len(pkt) < 14:
+            continue                     # too short to even carry an ethertype
         if int.from_bytes(pkt[12:14], "big") != ETH_TYPE_OUT:
             wrong_type += 1
             continue
-        frames.append(parse_jets_bytes(pkt))
+        try:
+            frames.append(parse_jets_bytes(pkt))
+        except ShortFrame as e:
+            short.append(str(e))
 
     if not frames:
-        sys.exit("no 0x%04X frames in %s (%d frames of another ethertype).\n"
+        sys.exit("no complete 0x%04X frames in %s (%d of another ethertype, "
+                 "%d truncated).\n"
                  "  If the capture is empty: check the ladder with "
                  "`jc_regs.py <B> dump` -- the first counter reading zero is "
                  "the stage that stopped." % (ETH_TYPE_OUT, args.file,
-                                              wrong_type))
+                                              wrong_type, len(short)))
 
     bad, ok, unknown, cycles = [], 0, [], []
     for f in frames:
@@ -135,6 +143,11 @@ def main():
     if unknown:
         print("  %d frames carried a seq not in %s: %s"
               % (len(unknown), args.pkt.name, unknown[:8]))
+    if short:
+        print("  %d truncated frame(s) skipped -- almost always tcpdump "
+              "killed before it flushed, not a card fault:" % len(short))
+        for s in short[:3]:
+            print("    %s" % s)
 
     sent_seqs = set(cells_by_seq)
     seen = {f["seq"] for f in frames}
