@@ -168,6 +168,27 @@ def main():
               % (min(c for _, c in cycles), max(c for _, c in cycles),
                  sum(per_cell) / len(per_cell)))
 
+    # Jet format version 2 instrumentation. p2p starts at the event's first
+    # cell, so p2p - cycles is deframe, ingest AND time queued in jc_evbuf --
+    # a large gap here means events are waiting, not that clustering is slow.
+    p2p = [f["p2p"] for f in frames if f.get("p2p")]
+    if p2p:
+        eng = [f["cycles"] for f in frames if f.get("p2p")]
+        gap = [a - b for a, b in zip(p2p, eng)]
+        print("  port-to-port: min %d, max %d, mean %.0f cycles (%.1f us)"
+              % (min(p2p), max(p2p), sum(p2p) / len(p2p),
+                 sum(p2p) / len(p2p) / 250.0))
+        print("    of which pre-engine (deframe+ingest+queuing): "
+              "min %d, max %d, mean %.0f" % (min(gap), max(gap),
+                                             sum(gap) / len(gap)))
+    st = [f["stale"] for f in frames if "stale" in f]
+    rf = [f["refresh"] for f in frames if "refresh" in f]
+    if st and any(st):
+        print("  stale rescans : min %d, max %d, mean %.1f"
+              % (min(st), max(st), sum(st) / len(st)))
+        print("  log refreshes : min %d, max %d, mean %.1f"
+              % (min(rf), max(rf), sum(rf) / len(rf)))
+
     # These ride in the frame header, sampled on the aclk side at jet_eoe, so
     # they are readable even when jc_regs' snapshot crossing is not. drop_full
     # against accepted events IS the duty cycle -- the figure step 10 sizes

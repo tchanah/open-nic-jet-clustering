@@ -28,7 +28,7 @@ P4_FRAC = 34
 P4_MASK = (1 << P4_W) - 1
 
 ETH_TYPE = 0x88B7
-FMT_VERSION = 0x01
+FMT_VERSION = 0x02      # JC_JET_FMT_VERSION: v2 added p2p, stale, refresh
 NMAX = 128
 
 
@@ -49,6 +49,9 @@ async def start_dut(dut):
         getattr(dut, s).value = 0
     dut.jet_seq.value = 0
     dut.ev_cycles.value = 0
+    dut.ev_p2p.value = 0
+    dut.ev_stale.value = 0
+    dut.ev_refresh.value = 0
     dut.cnt_drop_full.value = 0
     dut.cnt_drop_err.value = 0
     dut.cnt_bad_frame.value = 0
@@ -122,7 +125,10 @@ def parse_frame(beats):
         "drop_full": int.from_bytes(hdr[26:30], "big"),
         "drop_err": int.from_bytes(hdr[30:34], "big"),
         "bad_frame": int.from_bytes(hdr[34:38], "big"),
-        "reserved": hdr[38:64],
+        "p2p": int.from_bytes(hdr[38:42], "big"),
+        "stale": int.from_bytes(hdr[42:44], "big"),
+        "refresh": int.from_bytes(hdr[44:46], "big"),
+        "reserved": hdr[46:64],
         "size": beats[0][3] & 0xFFFF,
         "src": (beats[0][3] >> 16) & 0xFFFF,
         "jets": [],
@@ -167,7 +173,7 @@ def check_frame(f, jets, seq, cycles, label):
     assert f["cycles"] == cycles, f"{label}: cycles {f['cycles']} vs {cycles}"
     assert f["size"] == 64 + 16 * len(jets), (
         f"{label}: tuser_size {f['size']} vs {64 + 16 * len(jets)}")
-    assert f["reserved"] == bytes(26), f"{label}: reserved bytes not zero"
+    assert f["reserved"] == bytes(18), f"{label}: reserved bytes not zero"
 
     want = expect_jets(jets)
     assert f["jets"] == want, (
@@ -196,7 +202,7 @@ async def test_exactly_one_full_beat(dut):
             for i in range(4)]
     f = await run_event(dut, jets, seq=11, cycles=1234)
     check_frame(f, jets, 11, 1234, "four jets")
-    assert f["reserved"] == bytes(26)
+    assert f["reserved"] == bytes(18)
 
 
 @cocotb.test()

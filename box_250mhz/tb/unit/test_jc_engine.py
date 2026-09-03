@@ -397,6 +397,19 @@ async def test_back_to_back_events(dut):
 # EMIT or MERGE_I on the stored beam bit.
 S_DECIDE, S_EMIT, S_MERGE_I = 9, 10, 13
 
+# The full encoding, for the cycle census below. Names match jc_ctrl.sv:176-188.
+STATE_NAMES = [
+    "IDLE", "LOAD_RD", "LOAD", "SETUP_RD", "SETUP_GO", "SETUP_W",
+    "ARGMIN", "ARGMIN_W", "DECIDE_RD", "DECIDE",
+    "EMIT", "EMIT_MARK", "EMIT_MARK_W",
+    "MERGE_I", "MERGE_J", "MERGE_WR", "KIN", "KIN_W",
+    "SCAN_I", "SCAN_I_W",
+    "STALE_PICK", "STALE_RD", "STALE_GO", "STALE_W",
+    "REFRESH", "REFRESH_RD", "REFRESH_GO", "FINISH",
+]
+# Entering these states once == one unit of the thing the cost model counts.
+S_STALE_GO, S_REFRESH_GO = 22, 26
+
 
 async def trace_nn_writes(dut, done, log, watch):
     """Every write to one row's nearest-neighbour record, and who made it.
@@ -514,3 +527,116 @@ async def test_trace_round_decisions(dut):
         for who, idx, beam, nn, geo in nnlog:
             dut._log.info("  %-6s row=%-3d beam=%d nn=%-3d geo=%d",
                           who, idx, beam, nn, geo)
+
+
+async def census(dut, done, cycles, entries):
+    """Count cycles spent in each FSM state, and entries to each state.
+
+    Cycles say where the time goes; entries say how many times the variable
+    parts fired. A state's cost per entry is cycles/entries, which is what
+    separates "this state is slow" from "we go here too often".
+    """
+    prev = -1
+    while not done[0]:
+        await RisingEdge(dut.aclk)
+        try:
+            st = int(dut.u_ctrl.state.value)
+        except Exception:                                      # noqa: BLE001
+            continue
+        cycles[st] += 1
+        if st != prev:
+            entries[st] += 1
+        prev = st
+
+
+@cocotb.test()
+async def test_cycle_census_matches_the_cost_model(dut):
+    """Where do the cycles actually go? Measured, not fitted.
+
+    THE COST MODEL THIS CHECKS WAS NEVER MEASURED. The latency plan attributes
+    16,504 cycles at n=128 to three fixed costs -- sweep overhead, the jc_log2
+    refresh walk, and jc_setkin+CORDIC -- using merge/stale/refresh counts
+    (M~108, S~22, L~250) that were SOLVED FOR from the total, not observed. If
+    the real S or L differs, the predicted savings differ with it, and the work
+    would be aimed at the wrong state.
+
+    So this counts them. Diagnostic, not an assertion: it prints a per-state
+    census and the derived per-round costs. The one thing it does assert is
+    that the census adds up to the engine's own cycle_count, because a census
+    that does not account for every cycle is not evidence of anything.
+
+    Run it on the largest fixture event -- the cost model is quoted at n=128
+    and the fixed-vs-variable split only separates cleanly when n is large.
+    """
+    await start_dut(dut, 0.0)
+    events = all_events()
+    assert events, "no fixture; run model/make_fixture.py"
+
+    seq, cells = max(events, key=lambda e: len(e[1]))
+    jets_in = M.ingest(cells, FMT)
+    done = [False]
+    log = []
+    cycles = [0] * len(STATE_NAMES)
+    entries = [0] * len(STATE_NAMES)
+
+    cocotb.start_soon(evbuf(dut, jets_in, seq, done))
+    cocotb.start_soon(trace_rounds(dut, done, log))
+    cocotb.start_soon(census(dut, done, cycles, entries))
+
+    for _ in range(400000):
+        await RisingEdge(dut.aclk)
+        if dut.jet_eoe.value:
+            break
+    done[0] = True
+    await RisingEdge(dut.aclk)
+
+    total = int(dut.cycle_count.value)
+    merges = sum(1 for a, _s, _b in log if a == "MERGE")
+    emits = sum(1 for a, _s, _b in log if a == "EMIT")
+    # Read the engine's own counters, not state entries: A4 pipelined the
+    # refresh walk, so REFRESH_GO no longer exists as a per-row state. These
+    # are the same counters that ride out in the jets header on hardware, so
+    # this also checks that what the card will report is what sim measured.
+    stale = int(dut.stat_stale.value)
+    refresh = int(dut.stat_refresh.value)
+
+    dut._log.info("=== cycle census: seq %d, n=%d, %d cycles ===",
+                  seq, len(cells), total)
+    dut._log.info("%-12s %8s %8s %9s", "state", "cycles", "entries", "cyc/ent")
+    for st, name in enumerate(STATE_NAMES):
+        if not cycles[st]:
+            continue
+        per = cycles[st] / entries[st] if entries[st] else 0.0
+        dut._log.info("%-12s %8d %8d %9.1f",
+                      name, cycles[st], entries[st], per)
+
+    counted = sum(cycles)
+    dut._log.info("--- counts the model guessed at ---")
+    dut._log.info("merges   M = %-4d (model assumed ~108 at n=128)", merges)
+    dut._log.info("emits    J = %-4d", emits)
+    dut._log.info("stale    S = %-4d (~%.2f per round; model assumed ~22 total)",
+                  stale, stale / max(len(log), 1))
+    dut._log.info("refresh  L = %-4d (~%.2f per round; model assumed ~250)",
+                  refresh, refresh / max(len(log), 1))
+
+    setup = sum(cycles[st] for st in (1, 2, 3, 4, 5))
+    rounds_cyc = counted - setup - cycles[27]
+    dut._log.info("--- where the time went ---")
+    dut._log.info("SETUP (LOAD+SETUP_*)      %6d  %5.1f%%",
+                  setup, 100.0 * setup / max(counted, 1))
+    dut._log.info("rounds                    %6d  %5.1f%%  (%.1f cyc/round)",
+                  rounds_cyc, 100.0 * rounds_cyc / max(counted, 1),
+                  rounds_cyc / max(len(log), 1))
+    dut._log.info("KIN+KIN_W (setkin/CORDIC) %6d  %5.1f%%",
+                  cycles[16] + cycles[17],
+                  100.0 * (cycles[16] + cycles[17]) / max(counted, 1))
+    dut._log.info("REFRESH walk              %6d  %5.1f%%",
+                  cycles[24] + cycles[25] + cycles[26],
+                  100.0 * (cycles[24] + cycles[25] + cycles[26]) / max(counted, 1))
+
+    # A census that loses cycles is not evidence. cycle_count runs while state
+    # != S_IDLE (jc_ctrl.sv:331), so the census -- which samples every edge
+    # until jet_eoe -- should match it to within the IDLE cycles it also saw.
+    assert counted - cycles[0] == total, (
+        f"census {counted - cycles[0]} != cycle_count {total}; "
+        f"the census is missing cycles and its shares mean nothing")

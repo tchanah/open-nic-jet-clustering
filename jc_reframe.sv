@@ -55,6 +55,9 @@ module jc_reframe (
   // Live values, latched at jet_eoe. cycle_count is the engine's measurement
   // of the event just finished -- the step 9 number, per event, free.
   input                      [31:0] ev_cycles,
+  input                      [31:0] ev_p2p,        // deframe first beat -> here
+  input                      [15:0] ev_stale,
+  input                      [15:0] ev_refresh,
   input                      [31:0] cnt_drop_full,
   input                      [31:0] cnt_drop_err,
   input                      [31:0] cnt_bad_frame,
@@ -160,7 +163,8 @@ module jc_reframe (
 
   logic [CNT_W-1:0]  wp;                // jets buffered for the current event
   logic [CNT_W-1:0]  njets;             // jets in the frame being sent
-  logic [31:0]       seq_r, cyc_r, dropf_r, drope_r, bad_r;
+  logic [31:0]       seq_r, cyc_r, dropf_r, drope_r, bad_r, p2p_r;
+  logic [15:0]       stale_r, refresh_r;
   logic [BIDX_W-1:0] beat_idx;
 
   typedef enum logic [1:0] {
@@ -221,6 +225,9 @@ module jc_reframe (
     hdr[8*`JC_JHDR_OFF_DROP_FULL +: 32] = bswap32(dropf_r);
     hdr[8*`JC_JHDR_OFF_DROP_ERR  +: 32] = bswap32(drope_r);
     hdr[8*`JC_JHDR_OFF_BAD_FRAME +: 32] = bswap32(bad_r);
+    hdr[8*`JC_JHDR_OFF_P2P       +: 32] = bswap32(p2p_r);
+    hdr[8*`JC_JHDR_OFF_STALE     +: 16] = bswap16(stale_r);
+    hdr[8*`JC_JHDR_OFF_REFRESH   +: 16] = bswap16(refresh_r);
   end
 
   // ---- Egress -----------------------------------------------------------
@@ -318,7 +325,10 @@ module jc_reframe (
         if (wp_final != '0) begin
           njets   <= wp_final;
           seq_r   <= jet_seq;
-          cyc_r   <= ev_cycles;
+          cyc_r     <= ev_cycles;
+          p2p_r     <= ev_p2p;
+          stale_r   <= ev_stale;
+          refresh_r <= ev_refresh;
           dropf_r <= cnt_drop_full;
           drope_r <= cnt_drop_err;
           bad_r   <= cnt_bad_frame;

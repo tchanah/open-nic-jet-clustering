@@ -18,10 +18,20 @@ import json
 import math
 import pathlib
 import random
+import sys
 
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge
+
+sys.path.insert(
+    0, str(pathlib.Path(__file__).resolve().parents[3] / "model"))
+import jc_exact                                                 # noqa: E402
+
+# Own instance rather than jc_model's EXACT: this file already reads luts.json
+# directly, and importing jc_model here would pull in FastJet-adjacent code
+# for no reason. Same default table, so the same bits.
+EXACT = jc_exact.Exact()
 
 LUTS = json.loads(
     (pathlib.Path(__file__).resolve().parents[3] / "model" / "luts.json")
@@ -72,6 +82,55 @@ async def run_one(dut, px, py):
         if dut.done.value:
             return int(dut.out_phi.value)
     raise AssertionError(f"cordic never finished for ({px}, {py})")
+
+
+@cocotb.test()
+async def test_bit_exact_against_the_model_replica(dut):
+    """Every result identical to jc_exact.cordic_phi -- not close, IDENTICAL.
+
+    THE OTHER TESTS IN THIS FILE CANNOT CATCH A CHANGED ROTATION SEQUENCE.
+    They bound the error against math.atan2 at one delta LSB, which is the
+    right question for "is the angle correct" and the wrong one for "is the
+    angle the same as it was". A restructuring that shifts a result by one
+    unit in the last place passes all of them, and step 9d is what that costs:
+    jc_setkin's phi sat 4.6e-9 rad -- 2.5% of a delta LSB -- on the far side of
+    a truncation boundary from the model's, one merge became an emit, and the
+    hardware disagreed with the model on two events out of a thousand.
+
+    So this asserts against model/jc_exact.py, which replicates this module's
+    loop bit-for-bit and is what cluster_fixed uses. It is the regression that
+    makes a pipelining change to jc_cordic safe to believe: if the arithmetic
+    moved by a single unit anywhere, this fails and the tolerance tests do not.
+
+    Directed corners first, then a magnitude sweep -- 9d's lesson twice over,
+    since the random bench that missed the jc_log2 index wrap had a 1-in-4096
+    residual and never hit it.
+    """
+    await start_dut(dut)
+    rng = random.Random(0xC0FFEE)
+
+    cases = []
+    m = 1 << 40
+    for sx in (1, -1):
+        for sy in (1, -1):
+            cases += [(sx * m, sy * m), (sx * m, sy), (sx, sy * m)]
+    cases += [(m, 0), (0, m), (-m, 0), (0, -m), (1, 1), (-1, -1)]
+    # Across the dynamic range a merged jet actually spans.
+    for shift in range(4, 46, 3):
+        for _ in range(4):
+            cases.append((rng.randrange(1, 1 << shift) * rng.choice([1, -1]),
+                          rng.randrange(1, 1 << shift) * rng.choice([1, -1])))
+
+    for px, py in cases:
+        got = await run_one(dut, px, py)
+        want = EXACT.cordic_phi(px, py)
+        assert got == want, (
+            f"atan2({py}, {px}): RTL {got} != model {want}, "
+            f"delta {got - want} units "
+            f"({abs(got - want) / (1 << LUTS['delta_shift']):.3f} delta LSB). "
+            f"The arithmetic moved -- the tolerance tests would not see this.")
+
+    dut._log.info("%d vectors bit-identical to jc_exact.cordic_phi", len(cases))
 
 
 @cocotb.test()

@@ -164,7 +164,10 @@
 // cycle_count is the engine's own measurement of the event just finished --
 // the step 9 number, reported per event with no instrumentation to add.
 `define JC_JET_ETH_TYPE     16'h88B7
-`define JC_JET_FMT_VERSION  8'h01
+// Version 2 adds port-to-port cycles and the per-event stale/refresh counts.
+// Bumped so a host tool from before them reads a frame it does not understand
+// and says so, rather than silently reporting zeros as measurements.
+`define JC_JET_FMT_VERSION  8'h02
 `define JC_JET_BYTES        16      // fp32 x 4
 `define JC_JETS_PER_BEAT    4       // 64 / JC_JET_BYTES, so jet index IS word index
 
@@ -176,6 +179,21 @@
 `define JC_JHDR_OFF_DROP_FULL 26
 `define JC_JHDR_OFF_DROP_ERR  30
 `define JC_JHDR_OFF_BAD_FRAME 34
+// ---- Per-event instrumentation, added at jet format version 2 -----------
+// PORT-TO-PORT is the honest latency number. JC_JHDR_OFF_CYCLES counts only
+// while jc_ctrl is out of S_IDLE, so it excludes CMAC RX, deframe, ingest,
+// evbuf queuing, reframe and CMAC TX -- about 1.5 us. Noise against the
+// original 66 us, but several percent once the engine is under 45, and the
+// difference between a measured port-to-port figure and an estimate.
+//
+// STALE and REFRESH are the two DATA-DEPENDENT terms in the engine's cost.
+// Inferring them rather than counting them had them wrong by 5.4x and 27%,
+// which hid the entire stale-rescan cost. Simulation can sample them on one
+// event in ~20 s; the card samples a thousand in seconds, so they ride here
+// and every hardware run becomes a census over real data.
+`define JC_JHDR_OFF_P2P       38
+`define JC_JHDR_OFF_STALE     42
+`define JC_JHDR_OFF_REFRESH   44
 
 // =======================================================================
 // Fixed-point formats

@@ -76,7 +76,13 @@ def parse_jets_frame(beats):
         "drop_full": int.from_bytes(hdr[26:30], "big"),
         "drop_err": int.from_bytes(hdr[30:34], "big"),
         "bad_frame": int.from_bytes(hdr[34:38], "big"),
-        "reserved": hdr[38:64],
+        # Jet format version 2. `cycles` is the engine alone; `p2p` starts at
+        # the event's first cell, so it also carries the time the event spent
+        # queued in jc_evbuf -- the component cycles cannot see.
+        "p2p": int.from_bytes(hdr[38:42], "big"),
+        "stale": int.from_bytes(hdr[42:44], "big"),
+        "refresh": int.from_bytes(hdr[44:46], "big"),
+        "reserved": hdr[46:64],
         "jets": [],
     }
     if len(beats[0]) > 3:
@@ -125,6 +131,12 @@ def parse_jets_bytes(payload):
         "drop_full": int.from_bytes(hdr[26:30], "big"),
         "drop_err": int.from_bytes(hdr[30:34], "big"),
         "bad_frame": int.from_bytes(hdr[34:38], "big"),
+        # Jet format version 2. `cycles` is the engine alone; `p2p` starts at
+        # the event's first cell, so it also carries the time the event spent
+        # queued in jc_evbuf -- the component cycles cannot see.
+        "p2p": int.from_bytes(hdr[38:42], "big"),
+        "stale": int.from_bytes(hdr[42:44], "big"),
+        "refresh": int.from_bytes(hdr[44:46], "big"),
         "jets": [],
     }
     body = payload[HDR_BYTES:]

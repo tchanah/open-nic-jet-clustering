@@ -55,6 +55,8 @@ module jc_evbuf (
   output                                ev_valid,
   output        [`JC_CNT_W-1:0]         ev_count,
   output                         [31:0] ev_seq,
+  input                          [31:0] now,      // free-running, from the top
+  output                         [31:0] ev_t0,    // when this event arrived
   input                                 ev_accept,
 
   input         [`JC_IDX_W-1:0]         ev_addr,
@@ -116,6 +118,10 @@ module jc_evbuf (
   logic [1:0]       slot_state [0:1];
   logic [CNT_W-1:0] slot_count [0:1];
   logic      [31:0] slot_seq   [0:1];
+  // Arrival stamp, for the port-to-port measurement. PER SLOT, not global: a
+  // second event can arrive while the first is still clustering, which is the
+  // whole reason there are two slots.
+  logic      [31:0] slot_t0    [0:1];
 
   logic             wr_ptr, rd_ptr;   // strict alternation, see header
   logic [IDX_W-1:0] wr_addr;
@@ -152,6 +158,12 @@ module jc_evbuf (
     if (!aresetn) begin
       slot_state[0] <= SL_EMPTY;
       slot_state[1] <= SL_EMPTY;
+      // Reset outright rather than relying on the write that precedes every
+      // read: ev_t0 feeds a subtraction whose result reaches the output frame,
+      // and an X there propagates silently -- it does not fail, it just makes
+      // every beat unreadable.
+      slot_t0[0]    <= 32'd0;
+      slot_t0[1]    <= 32'd0;
       wr_ptr        <= 1'b0;
       rd_ptr        <= 1'b0;
       wr_addr       <= '0;
@@ -166,7 +178,13 @@ module jc_evbuf (
       if (pj_valid) begin
         if (pj_start) begin
           dropping <= !have_free;
-          if (have_free) slot_state[wr_ptr] <= SL_FILL;
+          if (have_free) begin
+            slot_state[wr_ptr] <= SL_FILL;
+            // The first cell of the event: jc_deframe has just decoded the
+            // header beat, so this is as close to "arrived" as the datapath
+            // can see without reaching back into the CMAC.
+            slot_t0[wr_ptr]    <= now;
+          end
         end
 
         if (!cur_drop) begin
@@ -210,6 +228,7 @@ module jc_evbuf (
   assign ev_valid = (slot_state[rd_ptr] == SL_READY);
   assign ev_count = slot_count[rd_ptr];
   assign ev_seq   = slot_seq[rd_ptr];
+  assign ev_t0    = slot_t0[rd_ptr];
 
   // Registered read. rd_ptr only moves on release, so it is stable for the
   // whole time the engine holds the event.

@@ -152,6 +152,14 @@ module jc_ctrl (
   output logic                          idle,
   output logic                   [31:0] event_count,
   output logic                   [31:0] cycle_count,  // of the event just done
+  // The two data-dependent cost terms, per event. See the census note below.
+  output logic                   [15:0] stat_stale,
+  output logic                   [15:0] stat_refresh,
+  // Arrival stamp, carried from jc_evbuf so the top can measure how long the
+  // event took from its first beat -- which includes the time it sat in a
+  // slot waiting, the one component cycle_count structurally cannot see.
+  input                          [31:0] ev_t0,
+  output logic                   [31:0] jet_t0,
 
   input                                 aclk,
   input                                 aresetn
@@ -233,8 +241,24 @@ module jc_ctrl (
 
   // ---- Single-row field select ------------------------------------------
   // The read is registered: probe_idx set this cycle, probe_* valid next.
+  //
+  // ONLY THE OFFSET IS REGISTERED INSIDE jc_mem. An index splits into a bank
+  // (the lane) and an offset within it; jc_mem registers the read of the
+  // offset, but the lane is a part-select applied out here, combinationally.
+  // So the lane must be delayed to match, or the field select picks a lane
+  // from THIS cycle's index out of data fetched for the PREVIOUS one -- two
+  // different rows blended into one apparently valid answer.
+  //
+  // It did not matter while every probe site held probe_idx still for two or
+  // more cycles, which every site did until the refresh walk started moving it
+  // every cycle. Delaying the lane is correct for the held sites too: if the
+  // index has not changed, the delayed lane is the same lane.
   logic [IDX_W-1:0] probe_idx;
-  wire [LANE_W-1:0] probe_lane = probe_idx[LANE_W-1:0];
+  logic [LANE_W-1:0] probe_lane;
+  always_ff @(posedge aclk) begin
+    if (!aresetn) probe_lane <= '0;
+    else          probe_lane <= probe_idx[LANE_W-1:0];
+  end
   assign mem_rd_off = probe_idx[IDX_W-1:LANE_W];
 
   wire signed [COORD_W-1:0] probe_y     = mem_rd_y  [probe_lane*COORD_W +: COORD_W];
@@ -248,13 +272,65 @@ module jc_ctrl (
   // The sweep leaves nn_geo linear and nn_dist_log stale; this is where the
   // two are reconciled, one row at a time through the borrowed log unit.
   // The log arrives Q7.32 and nn_dist_log is Q7.25, so it sheds LOG_TO_NN.
-  logic  [IDX_W-1:0]      log_row;
-  logic signed [WGT_W-1:0] log_wgt;
-  logic                    log_pending;
+  // MANY REQUESTS IN FLIGHT, NOT ONE. This was a single `log_pending` bit, so
+  // a row cost 10 cycles -- 1 to pick, 1 for jc_mem's registered read, 1 to
+  // issue, then 6 idle waiting for the answer before the next row could even
+  // be picked. jc_log2 sustains one request per cycle and jc_setkin proves it
+  // by issuing three back to back, so the unit was running at 6% of what it
+  // can do, on 20% of the whole event.
+  //
+  // Responses come back strictly in order -- it is one pipeline with no
+  // reordering -- so a plain FIFO of {row, weight} matched against
+  // sk_ext_log_rsp_valid is enough. Deliberately NOT a shift register keyed to
+  // LOG_LAT: that would silently encode the log unit's latency in a third
+  // place, and jc_setkin's LOG_LAT and test_jc_log2's LATENCY are already two
+  // too many. This way the depth only has to COVER the latency, not equal it.
+  localparam int LOGQ_D  = 8;                 // > jc_log2's 6, with slack
+  localparam int LOGQ_AW = 3;                 // $clog2(LOGQ_D)
+
+  logic [LOGQ_AW-1:0]      logq_wr, logq_rd;
+  logic [LOGQ_AW:0]        logq_cnt;          // 0..LOGQ_D, needs the extra bit
+  logic [IDX_W-1:0]        logq_row [0:LOGQ_D-1];
+  logic signed [WGT_W-1:0] logq_wgt [0:LOGQ_D-1];
+
+  wire logq_full  = (logq_cnt == LOGQ_D[LOGQ_AW:0]);
+  wire logq_empty = (logq_cnt == '0);
+
+  // Request pipeline, TWO deep -- the probe read takes two cycles, not one.
+  // probe_idx registers at the end of the pick cycle, mem_rd_off is
+  // combinational off it, and jc_mem registers THAT: pick at t, address valid
+  // t+1, data valid t+2. Every other probe site sits in a wait state with
+  // probe_idx held, so it never had to distinguish the two. This one moves the
+  // index every cycle, so it does.
+  logic       [1:0] rq_v;
+  logic [IDX_W-1:0] rq_row [0:1];
+
+  wire logq_push = (state == S_REFRESH) && rq_v[1];
+  wire logq_pop  = !logq_empty && sk_ext_log_rsp_valid;
+
+  // ---- Per-event census -------------------------------------------------
+  // S and L are the two data-dependent terms in the engine's cost, and the
+  // cycle model had them wrong by 5.4x and 27% when they were inferred rather
+  // than counted. They are cheap to count and they are what says whether a
+  // latency change moved the total for the reason predicted, so they ride out
+  // in the jets header rather than living only in a simulation.
+  logic [15:0] stale_count, refresh_count;
+  assign stat_stale   = stale_count;
+  assign stat_refresh = refresh_count;
+
+  // Read procedurally, never through a continuous assign: an unpacked array
+  // element behind `wire x = arr[i]` is the construct that stopped propagating
+  // inside jc_sweep's elaboration (trap 3).
+  logic [IDX_W-1:0]        rsp_row;
+  logic signed [WGT_W-1:0] rsp_wgt;
+  always_comb begin
+    rsp_row = logq_row[logq_rd];
+    rsp_wgt = logq_wgt[logq_rd];
+  end
 
   wire [LOG_OUT_W-LOG_TO_NN-1:0] log_q25 = sk_ext_log_rsp[LOG_OUT_W-1:LOG_TO_NN];
   wire signed [NNLOG_W-1:0] nn_log_result =
-       $signed({{(NNLOG_W-WGT_W){log_wgt[WGT_W-1]}}, log_wgt})
+       $signed({{(NNLOG_W-WGT_W){rsp_wgt[WGT_W-1]}}, rsp_wgt})
      + $signed({{(NNLOG_W-(LOG_OUT_W-LOG_TO_NN)){1'b0}}, log_q25});
 
   // ---- Jet gate ---------------------------------------------------------
@@ -306,7 +382,13 @@ module jc_ctrl (
       jet_eoe          <= 1'b0;
       event_count      <= 32'd0;
       cycle_count      <= 32'd0;
-      log_pending      <= 1'b0;
+      logq_wr          <= '0;
+      logq_rd          <= '0;
+      logq_cnt         <= '0;
+      rq_v             <= 2'b00;
+      stale_count      <= 16'd0;
+      refresh_count    <= 16'd0;
+      jet_t0           <= 32'd0;
       kin_sw_done      <= 1'b0;
       kin_sk_done      <= 1'b0;
       todo_scan        <= '0;
@@ -330,13 +412,25 @@ module jc_ctrl (
       if (jet_valid && jet_ready) jet_valid <= 1'b0;
       if (state != S_IDLE) cycle_count <= cycle_count + 32'd1;
 
-      // The borrowed log's answer can land in any state; catch it once.
-      if (log_pending && sk_ext_log_rsp_valid) begin
+      // The borrowed log's answer can land in any state; catch it once. In
+      // order, so the queue head is always the row this answer belongs to.
+      if (logq_pop) begin
         mem_log_wr_en  <= 1'b1;
-        mem_log_wr_idx <= log_row;
+        mem_log_wr_idx <= rsp_row;
         mem_log_wr_val <= nn_log_result;
-        log_pending    <= 1'b0;
+        logq_rd        <= logq_rd + 1'b1;
       end
+
+      if (logq_push) begin
+        logq_row[logq_wr] <= rq_row[1];
+        logq_wgt[logq_wr] <= probe_wgt;
+        logq_wr           <= logq_wr + 1'b1;
+        refresh_count     <= refresh_count + 16'd1;
+      end
+
+      // One update, so a same-cycle push and pop cancel rather than race.
+      if (logq_push != logq_pop)
+        logq_cnt <= logq_push ? (logq_cnt + 1'b1) : (logq_cnt - 1'b1);
 
       case (state)
 
@@ -347,9 +441,12 @@ module jc_ctrl (
             ev_accept   <= 1'b1;
             n_cells     <= ev_count;
             seq_r       <= ev_seq;
+            jet_t0      <= ev_t0;
             load_idx    <= '0;
             ev_addr     <= '0;
-            cycle_count <= 32'd0;
+            cycle_count   <= 32'd0;
+            stale_count   <= 16'd0;
+            refresh_count <= 16'd0;
             todo_scan   <= '0;
             todo_log    <= '0;
             idle        <= 1'b0;
@@ -596,6 +693,7 @@ module jc_ctrl (
         S_STALE_RD: state <= S_STALE_GO;
 
         S_STALE_GO: begin
+          stale_count  <= stale_count + 16'd1;
           sw_start     <= 1'b1;
           sw_mode      <= MODE_NN_SCAN;
           sw_query_idx <= scan_row;
@@ -619,39 +717,42 @@ module jc_ctrl (
         end
 
         // ---- Give every touched row a fresh nn_dist_log --------------
+        // ONE REQUEST PER CYCLE, in two overlapped stages. Stage A picks a row
+        // and presents its address; stage B issues the request the next cycle,
+        // when jc_mem's registered read has landed (trap 8). Both run every
+        // cycle, so row k+1 is being read while row k is being issued.
+        //
+        // Stage A is gated on ready AND queue space so stage B can never be
+        // blocked -- if it could stall, probe_idx would already have moved on
+        // and the request would carry the wrong row's geometry.
         S_REFRESH: begin
-          if (!pick_valid && !log_pending) begin
-            in_setup <= 1'b0;
-            state    <= S_ARGMIN;
+          // Stage 0: pick a row and present its address.
+          if (pick_valid && sk_ext_log_ready && !logq_full) begin
+            probe_idx          <= pick_idx;
+            rq_row[0]          <= pick_idx;
+            rq_v[0]            <= 1'b1;
+            todo_log[pick_idx] <= 1'b0;
           end
-          else if (pick_valid && sk_ext_log_ready && !log_pending) begin
-            probe_idx <= pick_idx;
-            log_row   <= pick_idx;
-            state     <= S_REFRESH_RD;
-          end
-        end
+          else rq_v[0] <= 1'b0;
 
-        // The read is registered like every other probe site: without this
-        // wait, nn_geo and the weight both come from the PREVIOUS row and
-        // every nn_dist_log in the event is computed from the wrong pair.
-        S_REFRESH_RD: state <= S_REFRESH_GO;
+          // Stage 1: address is on the memory this cycle, data lands next.
+          rq_v[1]   <= rq_v[0];
+          rq_row[1] <= rq_row[0];
 
-        // The ready check belongs HERE, on the cycle the request is actually
-        // issued -- S_REFRESH tested it two states ago. jc_setkin only lends
-        // its log unit while idle, so a request issued into a busy setkin is
-        // dropped on the floor while log_pending stays set and S_REFRESH
-        // waits for an answer that will never come. Unreachable today, since
-        // jc_ctrl is itself the only thing that starts setkin and it is
-        // sitting here, but that is an argument, not a guarantee. probe_idx
-        // holds, so probe_nngeo and probe_wgt stay valid while we wait.
-        S_REFRESH_GO: begin
-          if (sk_ext_log_ready) begin
+          // Stage 2: data for rq_row[1] is valid now, and probe_lane -- also
+          // one cycle behind probe_idx -- selects the matching bank.
+          if (rq_v[1]) begin
             sk_ext_log_valid <= 1'b1;
             sk_ext_log_x     <= {{(LOG_IN_W-GEO_W){1'b0}}, probe_nngeo};
-            log_wgt          <= probe_wgt;
-            log_pending      <= 1'b1;
-            todo_log[log_row] <= 1'b0;
-            state            <= S_REFRESH;
+          end
+
+          // LEAVE ONLY WHEN EVERY ANSWER HAS LANDED, not when todo_log empties.
+          // ARGMIN ranks on nn_dist_log; exiting with a response still in the
+          // pipe would rank a row on its previous value -- a wrong merge, in
+          // the correct-looking direction, with nothing downstream to catch it.
+          if (!pick_valid && (rq_v == 2'b00) && logq_empty) begin
+            in_setup <= 1'b0;
+            state    <= S_ARGMIN;
           end
         end
 

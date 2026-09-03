@@ -156,6 +156,7 @@ module jet_clustering (
     .pj_start (pj_start), .pj_last (pj_last), .pj_err (pj_err),
     .pj_event_seq (pj_event_seq), .pj_ready (pj_ready),
 
+    .now (now), .ev_t0 (ev_t0),
     .ev_valid (ev_valid), .ev_count (ev_count), .ev_seq (ev_seq),
     .ev_accept (ev_accept), .ev_addr (ev_addr),
     .ev_energy (ev_energy), .ev_px (ev_px), .ev_py (ev_py), .ev_pz (ev_pz),
@@ -174,9 +175,33 @@ module jet_clustering (
   wire              [31:0]   jet_seq;
   wire                       engine_idle;
   wire              [31:0]   engine_events, engine_cycles;
+  wire              [15:0]   engine_stale, engine_refresh;
+  wire              [31:0]   ev_t0, jet_t0;
+
+  // ---- Port-to-port stopwatch -------------------------------------------
+  // Free-running, wraps every 17 s at 250 MHz; only differences are read, and
+  // an event lives tens of microseconds, so the wrap is harmless.
+  //
+  // WHAT IT MEASURES, precisely: jc_deframe's first cell of the event through
+  // to jc_ctrl finishing it. That is CMAC RX and deframe already behind it,
+  // plus ingest, plus TIME SPENT WAITING IN A SLOT, plus clustering. The
+  // queuing term is the one that matters and the one cycle_count structurally
+  // cannot see -- under load an event can sit in jc_evbuf while the engine
+  // works on its predecessor, and that wait is real latency.
+  //
+  // It stops short of jc_reframe's framing and CMAC TX, and that is forced,
+  // not an oversight: the header is beat 0, so a frame cannot report its own
+  // completion. Those two are small and deterministic (~128 ns of framing,
+  // CMAC order 100-200 ns) where the queuing term is neither.
+  logic [31:0] now;
+  always_ff @(posedge aclk) begin
+    if (!aresetn) now <= 32'd0;
+    else          now <= now + 32'd1;
+  end
 
   jc_engine u_engine (
     .ev_valid (ev_valid), .ev_count (ev_count), .ev_seq (ev_seq),
+    .ev_t0 (ev_t0), .jet_t0 (jet_t0),
     .ev_accept (ev_accept), .ev_addr (ev_addr),
     .ev_energy (ev_energy), .ev_px (ev_px), .ev_py (ev_py), .ev_pz (ev_pz),
     .ev_rapidity (ev_rapidity), .ev_phi (ev_phi),
@@ -190,6 +215,7 @@ module jet_clustering (
 
     .idle (engine_idle),
     .event_count (engine_events), .cycle_count (engine_cycles),
+    .stat_stale (engine_stale), .stat_refresh (engine_refresh),
 
     .aclk (aclk), .aresetn (aresetn)
   );
@@ -203,6 +229,10 @@ module jet_clustering (
     .jet_seq (jet_seq), .jet_eoe (jet_eoe), .jet_ready (jet_ready),
 
     .ev_cycles (engine_cycles),
+    // Elapsed since the event's first cell. jc_reframe latches it at jet_eoe,
+    // so the subtraction is taken at the moment clustering completes.
+    .ev_p2p (now - jet_t0),
+    .ev_stale (engine_stale), .ev_refresh (engine_refresh),
     .cnt_drop_full (drop_full_count), .cnt_drop_err (drop_err_count),
     .cnt_bad_frame (bad_event_count),
 

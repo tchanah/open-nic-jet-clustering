@@ -23,6 +23,8 @@ module jc_engine (
   input                                 ev_valid,
   input  [`JC_CNT_W-1:0]                ev_count,
   input                          [31:0] ev_seq,
+  input                          [31:0] ev_t0,
+  output                         [31:0] jet_t0,
   output                                ev_accept,
   output [`JC_IDX_W-1:0]                ev_addr,
   input  signed [`JC_P4_W-1:0]          ev_energy, ev_px, ev_py, ev_pz,
@@ -46,6 +48,9 @@ module jc_engine (
   output                                idle,
   output                         [31:0] event_count,
   output                         [31:0] cycle_count,
+  // Per-event counts of the two data-dependent cost terms, for the header.
+  output                         [15:0] stat_stale,
+  output                         [15:0] stat_refresh,
 
   input                                 aclk,
   input                                 aresetn
@@ -203,6 +208,7 @@ module jc_engine (
   // ---- The round FSM ----------------------------------------------------
   jc_ctrl u_ctrl (
     .ev_valid (ev_valid), .ev_count (ev_count), .ev_seq (ev_seq),
+    .ev_t0 (ev_t0), .jet_t0 (jet_t0),
     .ev_accept (ev_accept), .ev_addr (ev_addr),
     .ev_energy (ev_energy), .ev_px (ev_px), .ev_py (ev_py), .ev_pz (ev_pz),
     .ev_rapidity (ev_rapidity), .ev_phi (ev_phi),
@@ -263,6 +269,7 @@ module jc_engine (
     .jet_seq (jet_seq), .jet_eoe (jet_eoe), .jet_ready (jet_ready),
 
     .idle (idle), .event_count (event_count), .cycle_count (cycle_count),
+    .stat_stale (stat_stale), .stat_refresh (stat_refresh),
 
     .aclk (aclk), .aresetn (aresetn)
   );
